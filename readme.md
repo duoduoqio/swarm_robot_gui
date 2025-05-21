@@ -8,7 +8,7 @@
 
 | 单机控制 | 多点定位 | 模型控制（方形轨迹） |
 |:--------:|:--------:|:--------------------:|
-| ![](gif/A_demonstration_of_a_single_machine.gif) | ![](gif/Locate_multiple_points.gif) | ![](gif/model_control.gif) |
+| ![](gif/A_demonstration_of_a_single_machine.gif) | ![](gif/locate-multiple-points.gif) | ![](gif/model-control.gif) |
 
 
 ---
