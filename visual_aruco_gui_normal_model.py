@@ -1,7 +1,8 @@
 
 from __future__ import annotations
 import sys, math, os, threading, concurrent.futures
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Callable, Any
+
 
 import cv2, numpy as np, serial, serial.tools.list_ports
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
@@ -10,6 +11,8 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QComboBox, QCheckBox,
     QLineEdit, QFormLayout, QMessageBox, QHBoxLayout, QVBoxLayout, QGroupBox
 )
+
+from model import square_model  # 导入模型函数
 
 # ---------- 启用 OpenCV 内部多线程 ----------
 cv2.setNumThreads(os.cpu_count() or 4)
@@ -78,6 +81,14 @@ class RobotGUI(QWidget):
         self.setWindowTitle("多机器人控制 – 修改版")
         self.resize(1200, 640)
 
+        # 在模型参数区
+        self.model_func = None                    # 外部模型回调
+        self.model_waypoints: Dict[int, List[Tuple[float,float]]] = {}
+        self._wp_idx: Dict[int,int] = {}          # 每辆车的当前 waypoint 索引
+        self.model_targets: Dict[int, Tuple[float,float]] = {}
+        # 模型目标显示开关，默认打开
+        self.show_model_targets = True
+
         # 参数
         self.valid_ids = set(range(16))
         self.max_jump_px = 80
@@ -92,6 +103,9 @@ class RobotGUI(QWidget):
 
         # 随机为每个 ID 指定颜色带透明度
         self.colors: Dict[int, QColor] = {i: QColor.fromHsv((i * 30) % 360, 255, 200, 128) for i in range(16)}
+
+        # 用于 waypoint 模式只更新一次
+        self._model_waypoint_inited = False
 
         self._build_ui()
         self._draw_grid()
@@ -127,6 +141,17 @@ class RobotGUI(QWidget):
 
         self.chk_group = QCheckBox("群控模式"); self.chk_group.setChecked(False)
         vctrl.addWidget(self.chk_group)
+
+        # 新增：模型控制模式
+        self.chk_model = QCheckBox("模型控制模式")
+        self.chk_model.setChecked(False)
+        vctrl.addWidget(self.chk_model)
+
+        # 在“模型控制模式”下面：
+        self.chk_show_model_targets = QCheckBox("显示模型目标点")
+        self.chk_show_model_targets.setChecked(True)
+        vctrl.addWidget(self.chk_show_model_targets)
+
 
         self.lbl_canvas = QLabel(); self.lbl_canvas.setFixedSize(self.w, self.h)
         self.lbl_canvas.mousePressEvent = self._canvas_click
@@ -181,38 +206,102 @@ class RobotGUI(QWidget):
 
     def _toggle_send(self):
         if self.timer_send.isActive():
-            self.timer_send.stop(); self.btn_send.setText("开始发送"); self.lbl_status.setText("发送已停止")
+            # 停止发送
+            self.timer_send.stop()
+            self.btn_send.setText("开始发送")
+            self.lbl_status.setText("发送已停止")
         else:
+            # 开始发送
             if not hasattr(self,'ser') or not self.ser.is_open:
-                QMessageBox.warning(self,"串口未打开","请先打开串口"); return
-            # 群控启动时用 20ms
-            self.timer_send.start(20); self.btn_send.setText("停止发送"); self.lbl_status.setText("发送中…")
+                QMessageBox.warning(self,"串口未打开","请先打开串口")
+                return
+            # 重置 waypoint 初始化标志
+            self._model_waypoint_inited = False
+
+            self.timer_send.start(20)
+            self.btn_send.setText("停止发送")
+            self.lbl_status.setText("发送中…")
+
 
     def _send_packet(self):
-        if not hasattr(self,'ser') or not self.ser.is_open:
-            self._toggle_send(); return
-        targets = []
+        # 1) 串口准备
+        if not hasattr(self, 'ser') or not self.ser.is_open:
+            self._toggle_send()
+            return
+
+        # 2) 如果模型模式：
+        if self.chk_model.isChecked():
+            # 2.1 如果是 waypoint 且还没初始化，就更新一次
+            if not self._model_waypoint_inited:
+                self._update_model_targets()
+                # 如果确实是 waypoint 输出，则标记已初始化
+                if self.model_waypoints:
+                    self._model_waypoint_inited = True
+            # 2.2 对于直接目标模式，我们还是每次都刷新
+            elif not self.model_waypoints:
+                self._update_model_targets()
+                
+        # 3) 确定要发送的机器人列表
         if self.chk_group.isChecked():
-            # 群控：针对所有检测到的机器人
-            for rid in self.robots.keys():
-                targets.append(rid)
+            targets = list(self.robots.keys())
         else:
             targets = [int(self.cmb_id.currentText())]
 
+        sent = 0
         for rid in targets:
-            try: spd = int(self.le_speed.text())&0xFF
-            except: spd = 0
-            angle = 0
-            if self.target_world and rid in self.robots:
-                rx,ry = self.robots[rid][1]; tx,ty = self.target_world
-                print(f"目标点: {tx:.4f}, {ty:.4f} 机器人ID{rid} 坐标: {rx:.4f}, {ry:.4f}")
-                target_a = math.degrees(math.atan2(ty-ry, tx-rx))
-                angle = int((target_a+360+270)%360)
-                print(f"目标角度: {target_a:.4f} 机器人ID{rid} 角度: {angle}")
-            pkt = bytes([rid, (angle>>8)&0xFF, angle&0xFF, spd])
-            try: self.ser.write(pkt)
-            except Exception as e: QMessageBox.critical(self,"发送失败",str(e)); self._toggle_send(); return
-        self.lbl_status.setText(f"已发送 {len(targets)} 个目标包")
+            # 4) 根据当前模式拿 tx, ty
+            if self.chk_model.isChecked():
+                # a) waypoint 模式
+                if rid in self.model_waypoints:
+                    idx    = self._wp_idx.get(rid, 0)
+                    wp     = self.model_waypoints[rid]
+                    # 超出则停在最后一个
+                    if idx >= len(wp):
+                        tx, ty = wp[-1]
+                    else:
+                        tx, ty = wp[idx]
+                        # 到达容差内就进入下一个
+                        rx, ry = self.robots[rid][1]
+                        if math.hypot(tx-rx, ty-ry) < 0.02:
+                            self._wp_idx[rid] = idx + 1
+                # b) 直接目标模式
+                elif rid in self.model_targets:
+                    tx, ty = self.model_targets[rid]
+                else:
+                    # 模式下没给目标，就跳过
+                    continue
+            else:
+                # 鼠标模式
+                if self.target_world and rid in self.robots:
+                    tx, ty = self.target_world
+                else:
+                    continue
+
+            # 5) 速度
+            try:
+                spd = int(self.le_speed.text()) & 0xFF
+            except ValueError:
+                spd = 0
+
+            # 6) 角度都用上面算出的 tx,ty
+            rx, ry = self.robots[rid][1]
+            target_a = math.degrees(math.atan2(ty - ry, tx - rx))
+            # +270 是因为你协议里把 0° 定义在“上方”，顺时针算
+            angle = int((target_a + 360 + 270) % 360)
+
+            # 7) 打包并发送
+            pkt = bytes([rid, (angle >> 8) & 0xFF, angle & 0xFF, spd])
+            try:
+                self.ser.write(pkt)
+                sent += 1
+            except Exception as e:
+                QMessageBox.critical(self, "发送失败", str(e))
+                self._toggle_send()
+                return
+
+        # 8) 状态更新
+        self.lbl_status.setText(f"已发送 {sent} 个目标包")
+
 
     def _on_frame(self, frame: np.ndarray, corners: list, ids: list):
         # 更新当前 ID 列表
@@ -223,7 +312,7 @@ class RobotGUI(QWidget):
                 self.robots.pop(rid, None)
                 self.last_px_pos.pop(rid, None)
         # 绘制目标
-        if self.target_world:
+        if not self.chk_model.isChecked() and self.target_world:
             tx, ty = self.target_world
             tx_px = int(tx*self.px_per_m + self.w/2)
             ty_px = int(self.h/2 - ty*self.px_per_m)
@@ -266,38 +355,77 @@ class RobotGUI(QWidget):
         pm = self.pm_base.copy()
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.Antialiasing)
-        # 画路径，每个 ID 不同颜色、带透明
+
+        # 1) 画历史路径
         for rid, path in self.robot_paths.items():
             color = self.colors.get(rid, QColor(0,0,255,128))
             pen = QPen(color, 2)
             painter.setPen(pen)
             for pt1, pt2 in zip(path, path[1:]):
                 painter.drawLine(pt1[0], pt1[1], pt2[0], pt2[1])
-        # 目标点
-        if self.target_world:
-            tx, ty = self.target_world
-            tx_c = int(tx*self.px_per_m + self.w/2)
-            ty_c = int(self.h/2 - ty*self.px_per_m)
-            painter.setPen(Qt.red); painter.setBrush(Qt.red)
-            painter.drawEllipse(tx_c-5, ty_c-5, 10, 10)
-            if self.chk_detail_canvas.isChecked():
-                painter.setPen(Qt.black)
-                painter.drawText(tx_c+8, ty_c, f"T px({tx_c},{ty_c}) m({tx:.2f},{ty:.2f})")
-        # 画机器人标记
-        painter.setFont(QFont('Arial',10))
+
+        # 2) 如果是模型模式，画模型目标点；否则画鼠标目标
+        if self.chk_model.isChecked() and self.chk_show_model_targets.isChecked():
+            for rid, ((cx, cy), (wx, wy)) in self.robots.items():
+                # 找下一个目标 tx,ty
+                if rid in self.model_waypoints:
+                    idx = self._wp_idx.get(rid, 0)
+                    pts = self.model_waypoints[rid]
+                    # 如果索引越界，就用最后一个点
+                    tx, ty = pts[-1] if idx >= len(pts) else pts[idx]
+                elif rid in self.model_targets:
+                    tx, ty = self.model_targets[rid]
+                    print(f"Model target: {tx:.2f}, {ty:.2f}")
+                else:
+                    continue
+
+                # 世界坐标->像素
+                tx_c = int(tx * self.px_per_m + self.w/2)
+                ty_c = int(self.h/2 - ty * self.px_per_m)
+
+                # 蓝色目标点
+                painter.setPen(Qt.blue)
+                painter.setBrush(Qt.blue)
+                painter.drawEllipse(tx_c-5, ty_c-5, 10, 10)
+
+                if self.chk_detail_canvas.isChecked():
+                    painter.setPen(Qt.black)
+                    painter.drawText(tx_c + 8, ty_c,
+                                    f"M: ID{rid} px({tx_c},{ty_c}) m({tx:.2f},{ty:.2f})")
+        else:
+            # 鼠标模式下的红色点
+            if self.target_world:
+                tx, ty = self.target_world
+                tx_c = int(tx * self.px_per_m + self.w/2)
+                ty_c = int(self.h/2 - ty * self.px_per_m)
+                painter.setPen(Qt.red)
+                painter.setBrush(Qt.red)
+                painter.drawEllipse(tx_c-5, ty_c-5, 10, 10)
+                if self.chk_detail_canvas.isChecked():
+                    painter.setPen(Qt.black)
+                    painter.drawText(tx_c+8, ty_c,
+                                    f"T px({tx_c},{ty_c}) m({tx:.2f},{ty:.2f})")
+
+        # 3) 画机器人当前位置标记
+        painter.setFont(QFont('Arial', 10))
         for rid, ((cx, cy), (wx, wy)) in self.robots.items():
-            color = self.colors.get(rid, QColor(0,0,255,128))
-            painter.setPen(color); painter.setBrush(color)
+            color = self.colors.get(rid, QColor(0, 0, 255, 128))
+            painter.setPen(color)
+            painter.setBrush(color)
             painter.drawEllipse(int(cx)-5, int(cy)-5, 10, 10)
             if self.chk_detail_canvas.isChecked():
                 painter.setPen(Qt.black)
                 painter.drawText(int(cx)+8, int(cy), f"ID{rid}")
                 painter.drawText(int(cx)+8, int(cy)+12, f"px({int(cx)},{int(cy)})")
                 painter.drawText(int(cx)+8, int(cy)+24, f"m({wx:.2f},{wy:.2f})")
+
         painter.end()
         self.lbl_canvas.setPixmap(pm)
 
+
     def _canvas_click(self, event):
+        if self.chk_model.isChecked():
+            return  # 模型模式下忽略点击
         x = event.position().x(); y = event.position().y()
         wx = (x - self.w/2)/self.px_per_m
         wy = (self.h/2 - y)/self.px_per_m
@@ -312,6 +440,40 @@ class RobotGUI(QWidget):
             self.ser.close()
         e.accept()
 
+    def set_model(self, func: Callable[[Dict[int,Tuple[float,float]]], Any]):
+        """
+        func 接收当前机器人位置字典 {id: (wx,wy)}
+        func 返回要么 {'waypoints': {id: [(x1,y1),...], ...}}
+                要么 {id: (x,y), ...}
+        """
+        self.model_func = func
+
+    def _update_model_targets(self):
+        if not self.model_func:
+            return
+        # 当前所有机器人位置（世界坐标）
+        pos_dict = {rid: data[1] for rid, data in self.robots.items()}
+        out = self.model_func(pos_dict)
+        print(f"Model output: {out}")
+        # 如果有 waypoints
+        if isinstance(out, dict) and 'waypoints' in out:
+            self.model_waypoints = out['waypoints']
+            # 重置所有索引
+            self._wp_idx = {rid: 0 for rid in self.model_waypoints}
+            # 同时清空单点目标
+            self.model_targets.clear()
+        else:
+            # 普通模式：直接每个 id -> 目标点
+            self.model_targets = out
+            # 清空 waypoints
+            self.model_waypoints.clear()
+            self._wp_idx.clear()
+
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    gui = RobotGUI(); gui.show(); sys.exit(app.exec())
+    gui = RobotGUI()
+    gui.set_model(square_model)
+    gui.show()
+    sys.exit(app.exec())
