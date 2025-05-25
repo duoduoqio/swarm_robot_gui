@@ -6,13 +6,18 @@ from typing import Dict, List, Tuple, Callable, Any
 
 import cv2, numpy as np, serial, serial.tools.list_ports
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont, QTransform
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QComboBox, QCheckBox,
-    QLineEdit, QFormLayout, QMessageBox, QHBoxLayout, QVBoxLayout, QGroupBox
+    QLineEdit, QFormLayout, QMessageBox, QHBoxLayout, QVBoxLayout, QGroupBox, QSlider
 )
 
-from model import square_model  # 导入模型函数
+from model import square_model,square_dense_model  # 导入模型函数
+
+from env import Environment  # 导入环境类
+from swarm_robot import SwarmRobot  # 导入机器人类
+
+
 
 # ---------- 启用 OpenCV 内部多线程 ----------
 cv2.setNumThreads(os.cpu_count() or 4)
@@ -78,8 +83,29 @@ class DetectWorker(QThread):
 class RobotGUI(QWidget):
     def __init__(self):
         super().__init__()
+
         self.setWindowTitle("多机器人控制 – 修改版")
         self.resize(1200, 640)
+
+        # —— 新增：初始化环境，并加载图片
+        self.env = Environment(image_name="round", 
+                                swarm_size=20,  # 设置足够大的空间
+                                r_sense=0.05, 
+                                boundary_mode="potential_field")
+
+        self.swarm_robot = SwarmRobot(env=self.env,
+                                dt=0.5,
+                                model="BaseSPH",
+                                seed=0)
+
+
+
+        # 默认参数
+        self.bg_scale = 1.0       # 缩放倍数
+        self.bg_tx = 0            # X 方向像素偏移
+        self.bg_ty = 0            # Y 方向像素偏移
+        self.bg_alpha = 0.5       # 透明度 0.0–1.0
+
 
         # 在模型参数区
         self.model_func = None                    # 外部模型回调
@@ -126,53 +152,123 @@ class RobotGUI(QWidget):
         vcam.addWidget(self.lbl_cam)
         self.chk_box = QCheckBox("显示识别框"); self.chk_box.setChecked(True)
         vcam.addWidget(self.chk_box)
-        self.chk_detail_cam = QCheckBox("显示详细数据"); self.chk_detail_cam.setChecked(False)
-        vcam.addWidget(self.chk_detail_cam)
         layout.addWidget(gp_cam)
         # 右：控制 + 画布
         gp_ctrl = QGroupBox("控制面板")
         vctrl = QVBoxLayout(gp_ctrl)
+
+        hbox_checks = QHBoxLayout()
+        # 初始化复选框
         self.chk_detail_canvas = QCheckBox("显示详细数据"); self.chk_detail_canvas.setChecked(False)
-        vctrl.addWidget(self.chk_detail_canvas)
+        self.chk_group         = QCheckBox("群控模式");     self.chk_group.setChecked(False)
+        self.chk_model         = QCheckBox("模型控制模式"); self.chk_model.setChecked(False)
+        self.chk_show_model_targets = QCheckBox("显示模型目标点"); self.chk_show_model_targets.setChecked(True)
+        # 按顺序加到水平布局
+        for cb in (self.chk_detail_canvas, self.chk_group, self.chk_model, self.chk_show_model_targets):
+            hbox_checks.addWidget(cb)
+        # 把水平布局添加到控制面板里
+        vctrl.addLayout(hbox_checks)
+
+
         # 新增：清空轨迹按钮
         self.btn_clear = QPushButton("清空轨迹")
         self.btn_clear.clicked.connect(self._clear_paths)
         vctrl.addWidget(self.btn_clear)
 
-        self.chk_group = QCheckBox("群控模式"); self.chk_group.setChecked(False)
-        vctrl.addWidget(self.chk_group)
-
-        # 新增：模型控制模式
-        self.chk_model = QCheckBox("模型控制模式")
-        self.chk_model.setChecked(False)
-        vctrl.addWidget(self.chk_model)
-
-        # 在“模型控制模式”下面：
-        self.chk_show_model_targets = QCheckBox("显示模型目标点")
-        self.chk_show_model_targets.setChecked(True)
-        vctrl.addWidget(self.chk_show_model_targets)
-
-
         self.lbl_canvas = QLabel(); self.lbl_canvas.setFixedSize(self.w, self.h)
         self.lbl_canvas.mousePressEvent = self._canvas_click
         vctrl.addWidget(self.lbl_canvas)
+
+
+
+        # —— 1. 横向排字段 —— #
+        hbox_fields = QHBoxLayout()
+        hbox_fields.setSpacing(15)
+        hbox_fields.setAlignment(Qt.AlignLeft)
+
+        # 创建控件
+        self.cmb_id    = QComboBox(); self.cmb_id.addItems([str(i) for i in range(16)])
+        self.le_x      = QLineEdit(); self.le_y = QLineEdit()
+        self.le_speed  = QLineEdit("10")
+
+        # 顺序填进去
+        for label, widget in [
+            ("机器人ID",    self.cmb_id),
+            ("目标X(m)",    self.le_x),
+            ("目标Y(m)",    self.le_y),
+            ("速度(hex)",   self.le_speed),
+            # ("串口",        self.cmb_port),
+            # ("波特率",      self.cmb_baud)
+        ]:
+            hbox_fields.addWidget(QLabel(label))
+            hbox_fields.addWidget(widget)
+
+        vctrl.addLayout(hbox_fields)
+
+        
         form = QFormLayout()
-        self.cmb_id = QComboBox(); self.cmb_id.addItems([str(i) for i in range(16)])
-        form.addRow("机器人ID", self.cmb_id)
-        self.le_x = QLineEdit(); self.le_y = QLineEdit(); self.le_speed = QLineEdit("10")
-        form.addRow("目标X(m)", self.le_x); form.addRow("目标Y(m)", self.le_y)
-        form.addRow("速度(hex)", self.le_speed)
+    
         self.cmb_port = QComboBox(); self._refresh_ports()
         self.cmb_baud = QComboBox(); self.cmb_baud.addItems(["9600", "19220", "38400", "57600", "115200"]); self.cmb_baud.setCurrentText("115200")
+
+        vctrl.addLayout(form)
+
+        # —— 2. 横向排按钮 —— #
+        hbox_buttons = QHBoxLayout()
+        hbox_buttons.setSpacing(20)
+        hbox_buttons.setAlignment(Qt.AlignLeft)
+
         btn_rf = QPushButton("刷新端口"); btn_rf.clicked.connect(self._refresh_ports)
         form.addRow("串口", self.cmb_port); form.addRow("波特率", self.cmb_baud); form.addRow(btn_rf)
         self.btn_open = QPushButton("打开串口"); self.btn_open.clicked.connect(self._toggle_port)
-        form.addRow(self.btn_open)
         self.btn_send = QPushButton("开始发送"); self.btn_send.clicked.connect(self._toggle_send)
-        form.addRow(self.btn_send)
-        vctrl.addLayout(form)
+
+        for btn in (btn_rf, self.btn_open, self.btn_send):
+            hbox_buttons.addWidget(btn)
+
+        vctrl.addLayout(hbox_buttons)
+
+
+
         self.lbl_status = QLabel("状态: 就绪"); vctrl.addWidget(self.lbl_status)
         layout.addWidget(gp_ctrl)
+
+
+
+
+        # —— 新增：背景图设置区 —— #
+        grp_bg = QGroupBox("背景设置")
+        lay_bg = QFormLayout(grp_bg)
+
+        # 缩放
+        sld_scale = QSlider(Qt.Horizontal)
+        sld_scale.setRange(10, 300)  # 10%–300%
+        sld_scale.setValue(int(self.bg_scale*100))
+        sld_scale.valueChanged.connect(lambda v: setattr(self, 'bg_scale', v/100) or self._draw_grid())
+        lay_bg.addRow("缩放(%)", sld_scale)
+
+        # X 偏移
+        sld_tx = QSlider(Qt.Horizontal)
+        sld_tx.setRange(-self.w//2, self.w//2)
+        sld_tx.setValue(self.bg_tx)
+        sld_tx.valueChanged.connect(lambda v: setattr(self, 'bg_tx', v) or self._draw_grid())
+        lay_bg.addRow("X 偏移(px)", sld_tx)
+
+        # Y 偏移
+        sld_ty = QSlider(Qt.Horizontal)
+        sld_ty.setRange(-self.h//2, self.h//2)
+        sld_ty.setValue(self.bg_ty)
+        sld_ty.valueChanged.connect(lambda v: setattr(self, 'bg_ty', v) or self._draw_grid())
+        lay_bg.addRow("Y 偏移(px)", sld_ty)
+
+        # 透明度
+        sld_alpha = QSlider(Qt.Horizontal)
+        sld_alpha.setRange(0, 100)
+        sld_alpha.setValue(int(self.bg_alpha*100))
+        sld_alpha.valueChanged.connect(lambda v: setattr(self, 'bg_alpha', v/100) or self._draw_grid())
+        lay_bg.addRow("透明度(%)", sld_alpha)
+
+        vctrl.addWidget(grp_bg)
 
     def _clear_paths(self):
         # 清空所有轨迹但保留当前机器人状态
@@ -180,13 +276,45 @@ class RobotGUI(QWidget):
         self._paint_canvas()
 
     def _draw_grid(self):
+        # 1) 新建一个空白 pixmap 画底图（网格）
         self.pm_base = QPixmap(self.w, self.h)
         self.pm_base.fill(Qt.white)
         painter = QPainter(self.pm_base)
+        painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(QPen(QColor('#dddddd')))
-        for x in range(0, self.w + 1, 100): painter.drawLine(x, 0, x, self.h)
-        for y in range(0, self.h + 1, 100): painter.drawLine(0, y, self.w, y)
+        for x in range(0, self.w + 1, 100):
+            painter.drawLine(x, 0, x, self.h)
+        for y in range(0, self.h + 1, 100):
+            painter.drawLine(0, y, self.w, y)
+
+        # 2) 尝试加载背景图
+        img = QImage(self.env.path)
+        print(f"[_draw_grid] Load BG: {self.env.path}, isNull={img.isNull()}")
+        if img.isNull():
+            painter.setPen(Qt.red)
+            painter.drawText(self.w//2 - 50, self.h//2, "背景图加载失败")
+        else:
+            # 缩放
+            sw = int(img.width() * self.bg_scale)
+            sh = int(img.height() * self.bg_scale)
+            img = img.scaled(sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            # 旋转（如果你有角度需求）
+            if hasattr(self.env, 'theta') and self.env.theta != 0:
+                t = QTransform().rotateRadians(self.env.theta)
+                img = img.transformed(t, Qt.SmoothTransformation)
+
+            # 透明度
+            painter.setOpacity(self.bg_alpha)
+
+            # 计算绘制坐标：居中 + 用户偏移
+            px = (self.w - img.width()) // 2 + self.bg_tx
+            py = (self.h - img.height()) // 2 + self.bg_ty
+            painter.drawImage(px, py, img)
+            painter.setOpacity(1.0)
+
         painter.end()
+        # 把这幅底图显示到 canvas
         self.lbl_canvas.setPixmap(self.pm_base)
 
     def _refresh_ports(self):
@@ -317,9 +445,6 @@ class RobotGUI(QWidget):
             tx_px = int(tx*self.px_per_m + self.w/2)
             ty_px = int(self.h/2 - ty*self.px_per_m)
             cv2.circle(frame, (tx_px, ty_px), 5, (0,0,255), -1)
-            if self.chk_detail_cam.isChecked():
-                cv2.putText(frame, f"T(px={tx_px},{ty_px}) m({tx:.2f},{ty:.2f})", (tx_px+5, ty_px-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
         # 绘制 ArUco
         if self.chk_box.isChecked() and corners:
             ids_np = np.array(ids, dtype=np.int32).reshape(-1,1)
@@ -344,10 +469,7 @@ class RobotGUI(QWidget):
             wy = (h/2 - cy)/self.px_per_m
             self.robots[rid] = ((cx, cy), (wx, wy))
             self.robot_paths.setdefault(rid, []).append((int(cx), int(cy)))
-            # 详细相机标注
-            if self.chk_detail_cam.isChecked():
-                txt = f"ID{rid} px({int(cx)},{int(cy)}) m({wx:.2f},{wy:.2f})"
-                cv2.putText(frame, txt, (int(cx)+5, int(cy)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
         # 刷新画布
         self._paint_canvas()
 
@@ -453,8 +575,11 @@ class RobotGUI(QWidget):
             return
         # 当前所有机器人位置（世界坐标）
         pos_dict = {rid: data[1] for rid, data in self.robots.items()}
-        out = self.model_func(pos_dict)
-        print(f"Model output: {out}")
+        if self.model_func.__name__ == "sph_model":
+            out = self.model_func(pos_dict, self.env, self.swarm_robot)
+        else:
+            out = self.model_func(pos_dict)
+        # print(f"Model output: {out}")
         # 如果有 waypoints
         if isinstance(out, dict) and 'waypoints' in out:
             self.model_waypoints = out['waypoints']
